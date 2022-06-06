@@ -41,8 +41,9 @@ class LOUVREDataset(Dataset):
     
     def encode_para(self, para, max_len):
         return self.tokenizer.encode_plus( \
-          para["title"].strip(), \
-          text_pair=para["text"].strip(), \
+          # para["title"].strip(), \
+          # text_pair=
+          para["text"].strip(), \
           max_length=max_len, \
           truncation=True, \
           return_tensors="pt" \
@@ -56,15 +57,19 @@ class LOUVREDataset(Dataset):
         question = sample['question']
         if question.endswith("?"):
             question = question[:-1]
-        if sample["type"] == "comparison":
-            random.shuffle(sample["pos_paras"])
-            start_para, bridge_para = sample["pos_paras"]
+            
+        empty_sample = {
+            "title": "", "text":""
+        }
+        
+        if len(sample["pos_paras"]) == 2: 
+            start_para = sample["pos_paras"][0]
+            bridge_para = sample["pos_paras"][1]
         else:
-            for para in sample["pos_paras"]:
-                if para["title"] != sample["bridge"]:
-                    start_para = para
-                else:
-                    bridge_para = para
+            assert len(sample["pos_paras"]) == 0
+            start_para = empty_sample 
+            bridge_para = empty_sample 
+            
         random.shuffle(sample["neg_paras"])
 
         start_para_codes = \

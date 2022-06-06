@@ -22,8 +22,8 @@ class LOUVREPredDataset(Dataset):
     
     def encode_para(self, title, text, max_len):
         return self.tokenizer( \
-          title, \
-          text_pair=text, \
+          # title, \
+          text, \
           max_length=max_len, \
           truncation=True, \
           padding="max_length",

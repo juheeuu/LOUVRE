@@ -307,12 +307,17 @@ class LOUVREEncoderTrain(BertPreTrainedModel):
         qvec = self.encode( \
             q_input_ids, \
             q_input_mask)
-        
+       
         pos_ctx1_input_ids = batch['pos_ctx1_input_ids']
         pos_ctx1_input_mask = batch['pos_ctx1_input_mask']
         pos_ctx1_vec = self.encode( \
             pos_ctx1_input_ids, \
             pos_ctx1_input_mask)
+        
+        # 여기서 negative sample 만 있는거 zero out .. 
+        pos_ctx1_input_len = pos_ctx1_input_mask.sum(dim=-1)
+        pos_ctx1_empty_mask = pos_ctx1_input_len == 2
+        pos_ctx1_vec[pos_ctx1_empty_mask] = 0.0
         
         q_sp_input_ids = batch['q_sp_input_ids']
         q_sp_input_mask = batch['q_sp_input_mask']
@@ -325,6 +330,11 @@ class LOUVREEncoderTrain(BertPreTrainedModel):
         pos_ctx2_vec = self.encode( \
             pos_ctx2_input_ids, \
             pos_ctx2_input_mask)
+        
+        # 여기서 negative sample 만 있는거 zero out .. 
+        pos_ctx2_input_len = pos_ctx2_input_mask.sum(dim=-1)
+        pos_ctx2_empty_mask = pos_ctx2_input_len == 2
+        pos_ctx2_vec[pos_ctx2_empty_mask] = 0.0
 
         neg_ctx1_input_ids = batch['neg_ctx1_input_ids']
         neg_ctx1_input_mask = batch['neg_ctx1_input_mask']
@@ -691,8 +701,8 @@ class LOUVRERetriever:
         self.max_q_sp_seq_length = config.max_q_sp_seq_length
         self.beam_size = config.beam_size
         self.topk = config.topk
-        self.index, self.index_s = self.build_index(config)
-        self.id2doc = self.load_corpus(config)
+        # self.index, self.index_s = self.build_index(config)
+        # self.id2doc = self.load_corpus(config)
         
         self.encoder = LOUVREEncoder \
             .from_pretrained( \
@@ -836,6 +846,121 @@ class LOUVRERetriever:
         total_D = np.stack(total_D, axis=0)
         total_I = np.stack(total_I, axis=0)
         return total_D, total_I
+    
+    def pred_nldb(self, data):
+        
+        ssg_data = []
+        db_count = 0
+        for item in tqdm(data, desc="Predicting...") :
+            queries, db = item['queries'], item['facts']
+        
+            # encode whole db
+            db_data = LOUVREQDataset( \
+                self.config.init_checkpoint,
+                self.max_q_seq_length,
+                [['', '<|endoftext|>']] + [['', d] for d in db])
+            db_dataloader = DataLoader( \
+                db_data, \
+                batch_size=len(db_data),
+                pin_memory=True, num_workers=16,
+                collate_fn=post_process_q_batch)
+
+            dvecs_all = []
+
+            for batch in db_dataloader: 
+                dvecs = self.encode( \
+                    batch['input_ids'], \
+                    batch['input_mask'])
+                dvecs_all.append(dvecs)
+
+            dvecs_all = torch.cat(dvecs_all, dim=0) # [db_size, 768] 
+
+            query_turncated = [
+                 ["", e['query'][:-1]] if e['query'].endswith("?") \
+                 else ["", e['query']] \
+                 for e in queries
+                ]
+
+            q_data = LOUVREQDataset( \
+                self.config.init_checkpoint,
+                self.max_q_seq_length,
+                query_turncated
+                )
+            q_dataloader = DataLoader( \
+                q_data, \
+                batch_size=1,
+                pin_memory=True, num_workers=16,
+                collate_fn=post_process_q_batch)
+            
+            q_count = 0
+            for i, batch in enumerate(q_dataloader):
+                qvecs = self.encode( \
+                    batch['input_ids'], \
+                    batch['input_mask']) # [1, 768] 
+
+                gt_k = len(queries[i]['facts'])
+
+                scores = torch.matmul(
+                            dvecs_all, 
+                            qvecs.transpose(0, 1)).squeeze(1) # [db_size]
+
+                _, indices = torch.topk(scores, gt_k) 
+
+                cands_1hop = (indices - 1).cpu().numpy().tolist()
+
+                final_sets = []
+                for cand_1hop in cands_1hop: 
+
+                    state = [cand_1hop]
+
+                    new_str = query_turncated[i][1]
+
+                    for t in range(3):
+
+                        new_str +=  "</s></s>" + db[state[t]] 
+                        new_input = q_data.encode_para("", new_str, self.max_q_seq_length)
+                        qvec_new = self.encode(new_input['input_ids'],
+                                                new_input['attention_mask']) 
+
+                        new_scores = torch.matmul(
+                                    dvecs_all, 
+                                    qvec_new.transpose(0, 1)).squeeze(1)
+
+                        _, new_indices = torch.topk(new_scores, 4)
+                        new_indices = (new_indices-1).cpu().numpy().tolist()
+                        for s in state: 
+                            if s in new_indices:
+                                new_indices.remove(s)
+
+                        top_1 = new_indices[0] 
+
+                        if top_1 == -1:
+                            break 
+
+                        state.append(top_1) 
+
+                    final_sets.append(state)
+                
+                q = queries[i]
+                data = {}
+                data["db_id"] = db_count
+                data["question_id"] = q_count
+                data["query"] = q["query"]
+                data["context_height"] = q["height"]
+                data["gold_facts"] = q["facts"]
+                data["answer"] = q["answer"]
+                data["metadata"] = {
+                    "relation_type": q["relation"],
+                    "query_type": q["type"],
+                }
+                data["ssg_output"] = final_sets
+
+                ssg_data.append(data)
+                q_count = q_count + 1
+
+            db_count = db_count + 1
+        return ssg_data
+            
         
     def pred(self, questions):
         logger.info("Encoding questions and searching")
